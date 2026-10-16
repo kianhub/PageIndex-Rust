@@ -299,7 +299,9 @@ async fn mcp_bridge_talks_to_local_server() {
 
 #[tokio::test]
 async fn mcp_server_rejects_non_localhost_bind() {
-    let err =
-        McpServer::new(Arc::new(StubBackend::one_doc()), false).bind("0.0.0.0:0".parse().unwrap()).await.unwrap_err();
+    let err = match McpServer::new(Arc::new(StubBackend::one_doc()), false).bind("0.0.0.0:0".parse().unwrap()).await {
+        Ok(_) => panic!("expected localhost-only bind to fail"),
+        Err(err) => err,
+    };
     assert!(err.message.contains("localhost"));
 }

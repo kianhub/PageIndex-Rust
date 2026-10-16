@@ -192,16 +192,11 @@ pub async fn handle_mcp_message(
     include_management: bool,
     message: &Value,
 ) -> Option<Value> {
-    let method = message.get("method").and_then(Value::as_str);
-    let id = message.get("id").cloned();
-    if method.is_none() {
-        return id.map(|id| rpc_error(id, -32600, "Invalid Request"));
-    }
-    let method = method.unwrap();
-    if id.is_none() {
-        return None;
-    }
-    let id = id.unwrap();
+    let method = match message.get("method").and_then(Value::as_str) {
+        Some(method) => method,
+        None => return message.get("id").cloned().map(|id| rpc_error(id, -32600, "Invalid Request")),
+    };
+    let id = message.get("id").cloned()?;
     let params = message.get("params");
     match method {
         "initialize" => Some(rpc_result(id, initialize_result(backend, include_management, params).await)),

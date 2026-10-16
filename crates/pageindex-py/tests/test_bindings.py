@@ -7,8 +7,6 @@ import sys
 import types
 from pathlib import Path
 
-import pytest
-
 import pageindex
 
 REPO = Path(__file__).resolve().parents[3]
@@ -145,7 +143,7 @@ def test_as_anthropic_tools_with_stub_sdk(tmp_path):
 
 
 def test_serve_mcp_initialize(tmp_path):
-    urllib = pytest.importorskip("urllib.request")
+    import urllib.request
     client = pageindex.Client(
         storage_path=str(tmp_path / "store"),
         optimize="off",
