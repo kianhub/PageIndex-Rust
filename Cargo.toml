@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["crates/pageindex-pdf", "crates/pageindex", "crates/pageindex-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/kianhub/PageIndex-Rust"
+
+[workspace.dependencies]
+pageindex-pdf = { path = "crates/pageindex-pdf", version = "0.1.0" }
+pageindex = { path = "crates/pageindex", version = "0.1.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
