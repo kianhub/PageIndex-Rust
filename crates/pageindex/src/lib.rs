@@ -27,8 +27,8 @@ pub mod tree_optimize;
 pub mod types;
 
 pub use agent::{
-    AGENT_INSTRUCTIONS, AgentBackend, CITE_PROMPT, as_anthropic_tools, as_claude_mcp, as_openai_tools, call_tool,
-    get_citations, resolve_citations, tool_names,
+    AGENT_INSTRUCTIONS, AgentBackend, CITE_PROMPT, as_anthropic_tools, as_claude_mcp, as_mcp_tools, as_openai_tools,
+    call_tool, get_citations, resolve_citations, tool_names,
 };
 pub use chat::{
     ChatRequest, run_chat_completions, run_chat_stream, run_cloud_chat_stream, run_messages, run_responses,
@@ -43,7 +43,7 @@ pub use flash::{FlashOptions, FlashResult, TocSource, flash_rejection_reason, pa
 pub use imaging::highlight_region;
 pub use llm::{LiteLlm, LlmClient};
 pub use markdown::{MdOptions, MdResult, md_to_tree};
-pub use mcp::McpBridge;
+pub use mcp::{McpBridge, McpServer, McpServerHandle, handle_mcp_message, jsonrpc_ids_equal};
 pub use tree::Node;
 pub use tree_optimize::{OptimizeOptions, OptimizeReport, merge_tree, optimize};
 pub use types::{

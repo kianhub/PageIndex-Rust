@@ -1,3 +1,6 @@
 /target
 /results
 .env
+__pycache__/
+*.so
+.venv/

@@ -25,8 +25,15 @@ tiktoken-rs = "0.7"
 tokio.workspace = true
 unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v4"] }
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1"] }
 
 [dev-dependencies]
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tempfile.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 
