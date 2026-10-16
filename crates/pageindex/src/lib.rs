@@ -7,6 +7,7 @@
 pub mod agent;
 pub mod chat;
 pub mod chat_stream;
+pub mod chatgpt;
 pub mod classic;
 pub mod client;
 pub mod cloud;
@@ -34,6 +35,7 @@ pub use chat::{
     ChatRequest, run_chat_completions, run_chat_stream, run_cloud_chat_stream, run_messages, run_responses,
 };
 pub use chat_stream::{ChatEvent, ChatStream};
+pub use chatgpt::{ChatGptClient, ChatGptStatus};
 pub use classic::{ClassicOptions, ClassicResult, page_index, page_index_main};
 pub use client::{OcrFormat, OcrResult, PageIndexClient, PageIndexLocalClient, SubmitOptions, SubmitResult};
 pub use cloud::{CloudApi, PageIndexCloudClient};

@@ -10,6 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
+use crate::chatgpt::ChatGptClient;
 use crate::config::{env_var, openai_api_key};
 use crate::error::{ErrorKind, PageIndexError, Result};
 use crate::types::Backend;
@@ -176,6 +177,15 @@ const PROVIDERS: &[Provider] = &[
         reasoning_effort: true,
     },
     Provider {
+        name: "chatgpt",
+        wire: Wire::OpenAi,
+        base: "https://api.openai.com/v1",
+        base_env: &[],
+        key_env: &[],
+        needs_key: false,
+        reasoning_effort: false,
+    },
+    Provider {
         name: "anthropic",
         wire: Wire::Anthropic,
         base: "https://api.anthropic.com/v1",
@@ -291,10 +301,17 @@ pub fn route(model: &str) -> Result<(&'static str, String)> {
 }
 
 /// The default client: real HTTP calls to the routed provider.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct LiteLlm {
     http: reqwest::Client,
     backend: Option<Backend>,
+    chatgpt: Option<ChatGptClient>,
+}
+
+impl std::fmt::Debug for LiteLlm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiteLlm").field("backend", &self.backend).finish_non_exhaustive()
+    }
 }
 
 impl LiteLlm {
@@ -304,7 +321,13 @@ impl LiteLlm {
 
     /// Route every call through these connection overrides.
     pub fn with_backend(backend: Backend) -> Self {
-        Self { http: reqwest::Client::new(), backend: Some(backend) }
+        Self { http: reqwest::Client::new(), backend: Some(backend), chatgpt: None }
+    }
+
+    /// Use this Sign in with ChatGPT client for `chatgpt/` models.
+    pub fn with_chatgpt(mut self, chatgpt: ChatGptClient) -> Self {
+        self.chatgpt = Some(chatgpt);
+        self
     }
 
     fn credentials(&self, provider: &Provider) -> Result<(String, Option<String>)> {
@@ -347,6 +370,14 @@ impl LlmClient for LiteLlm {
         tools: &[ToolSpec],
     ) -> Result<Completion> {
         let (provider_name, wire_model) = route(model)?;
+        if provider_name == "chatgpt" {
+            let chatgpt = self.chatgpt.clone().unwrap_or_else(|| {
+                let mut client = ChatGptClient::from_env();
+                client.http = self.http.clone();
+                client
+            });
+            return chatgpt.complete_turn(&wire_model, messages, params, tools).await;
+        }
         let provider = PROVIDERS.iter().find(|p| p.name == provider_name).expect("routed provider exists");
         let (base, key) = self.credentials(provider)?;
         let request = match provider.wire {
@@ -649,6 +680,7 @@ mod tests {
     fn routes_litellm_names() {
         assert_eq!(route("gpt-6-luna").unwrap(), ("openai", "gpt-6-luna".to_string()));
         assert_eq!(route("anthropic/claude-sonnet-5-5").unwrap().0, "anthropic");
+        assert_eq!(route("chatgpt/gpt-6.1-sol").unwrap(), ("chatgpt", "gpt-6.1-sol".to_string()));
         assert_eq!(route("litellm/openrouter/x/y").unwrap(), ("openrouter", "x/y".to_string()));
         assert_eq!(route("nope/model").unwrap_err().status_code, Some(404));
     }

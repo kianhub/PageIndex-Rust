@@ -69,8 +69,8 @@ Model names follow LiteLLM conventions: a bare name is an OpenAI model, and any 
 provider is written as `provider/model` (for example `anthropic/claude-sonnet-5-5`,
 `openrouter/...`, or `ollama/llama3`).
 
-Supported providers: OpenAI, Anthropic, OpenRouter, Groq, DeepSeek, Mistral, Together,
-Fireworks, xAI, Gemini, Ollama.
+Supported providers: OpenAI (API key, default), ChatGPT plan usage (opt-in `chatgpt/` prefix),
+Anthropic, OpenRouter, Groq, DeepSeek, Mistral, Together, Fireworks, xAI, Gemini, Ollama.
 
 Secrets come only from the environment or a local `.env` file, which is never committed:
 
@@ -82,6 +82,22 @@ Secrets come only from the environment or a local `.env` file, which is never co
 | `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`, `TOGETHERAI_API_KEY`, `FIREWORKS_API_KEY`, `XAI_API_KEY`, `GEMINI_API_KEY` | Their providers |
 | `OLLAMA_API_BASE` | Local Ollama (no key needed) |
 | `PAGEINDEX_API_KEY` | PageIndex Cloud |
+
+## Sign in with ChatGPT (optional)
+
+API keys remain the default. To use an eligible ChatGPT plan instead of `OPENAI_API_KEY`:
+
+```bash
+pageindex chatgpt login
+pageindex chatgpt status
+pageindex --pdf_path paper.pdf --chatgpt
+# equivalent: --index-model chatgpt/gpt-6.1-sol --summary-model chatgpt/gpt-6.1-sol
+pageindex chatgpt logout
+```
+
+This is OpenAI's official open-source [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source) flow: PKCE, an HTTP loopback callback on `127.0.0.1` (never `localhost`), `client_id=dynamic_agent_client` on first registration, then the issued `oaiapp_…` id. Tokens are stored only in `~/.config/pageindex/chatgpt.json` with owner-only (`0600`) permissions — never in the repo or logs. Inference is `POST https://api.openai.com/v1/responses` with the OAuth bearer token, `store: false`, and `stream: true`.
+
+See the [Sign in with ChatGPT Terms](https://openai.com/policies/sign-in-with-chatgpt-terms/).
 
 ## Benchmarks
 
