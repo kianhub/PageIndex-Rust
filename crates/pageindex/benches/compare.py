@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import resource
 import statistics
 import time
+import tracemalloc
 from pathlib import Path
 
 import tiktoken
@@ -75,13 +77,48 @@ def e2e_pdf(path: str):
     )
 
 
+def peak_rss_kb() -> int:
+    return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+
+
+def run_stage(stage: str, path: str):
+    if stage == "parse":
+        parse_pdf(path)
+    elif stage == "tree":
+        tree_pdf(path)
+    elif stage == "e2e":
+        e2e_pdf(path)
+    else:
+        raise SystemExit(f"unknown stage {stage!r}")
+
+
+def mem_one(stage: str, path: str) -> None:
+    """One stage in a fresh process: peak RSS plus tracemalloc peak live bytes."""
+    install_llm_stubs()
+    tracemalloc.start()
+    run_stage(stage, path)
+    _current, peak = tracemalloc.get_traced_memory()
+    print(json.dumps({"rss_kb": peak_rss_kb(), "alloc_bytes": peak, "alloc_count": 0}), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--docs", required=True)
-    parser.add_argument("--tokens", required=True)
-    parser.add_argument("--out", required=True)
+    parser.add_argument("--docs")
+    parser.add_argument("--tokens")
+    parser.add_argument("--out")
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--mem-one", choices=["parse", "tree", "e2e"])
+    parser.add_argument("--path")
     args = parser.parse_args()
+
+    if args.mem_one:
+        if not args.path:
+            raise SystemExit("--path is required with --mem-one")
+        mem_one(args.mem_one, args.path)
+        return
+
+    if not (args.docs and args.tokens and args.out):
+        raise SystemExit("--docs, --tokens, and --out are required")
 
     docs = json.loads(Path(args.docs).read_text())
     token_text = Path(args.tokens).read_text()

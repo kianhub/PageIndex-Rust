@@ -4,14 +4,74 @@
 //! Token counts use cl100k on the same extracted text. Tree and e2e use the
 //! same generated PDFs. The e2e pass uses a deterministic stub LLM on both
 //! sides (`{"subsections": []}` / `{"summary": "..."}`).
+//!
+//! Memory: each parse / tree / e2e sample is a fresh process. Peak RSS is
+//! Linux `VmHWM` (same as `getrusage` `ru_maxrss`). Python heap is
+//! tracemalloc peak live bytes; Rust heap is peak live bytes from the
+//! counting allocator below.
 
 #[path = "../tests/common/mod.rs"]
 mod common;
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+struct CountingAlloc;
+
+static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
+static ALLOC_LIVE: AtomicU64 = AtomicU64::new(0);
+static ALLOC_PEAK: AtomicU64 = AtomicU64::new(0);
+
+fn bump(size: usize) {
+    ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+    let live = ALLOC_LIVE.fetch_add(size as u64, Ordering::Relaxed) + size as u64;
+    ALLOC_PEAK.fetch_max(live, Ordering::Relaxed);
+}
+
+unsafe impl GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        bump(layout.size());
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        bump(layout.size());
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        ALLOC_LIVE.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let p = unsafe { System.realloc(ptr, layout, new_size) };
+        if !p.is_null() {
+            ALLOC_LIVE.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+            bump(new_size);
+        }
+        p
+    }
+}
+
+#[global_allocator]
+static GLOBAL: CountingAlloc = CountingAlloc;
+
+fn peak_rss_kb() -> u64 {
+    let Ok(text) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("VmHWM:") {
+            return rest.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap_or(0);
+        }
+    }
+    0
+}
 
 use async_trait::async_trait;
 use pageindex::OptimizeMode;
@@ -164,11 +224,134 @@ fn speedup(py: f64, rs: f64) -> String {
     if rs == 0.0 { "n/a".into() } else { format!("{:.1}×", py / rs) }
 }
 
+fn mb(kb: u64) -> String {
+    let mib = kb as f64 / 1024.0;
+    if mib >= 10.0 { format!("{mib:.1}") } else { format!("{mib:.2}") }
+}
+
+fn heap_mb(bytes: u64) -> String {
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    if mib >= 10.0 { format!("{mib:.1}") } else { format!("{mib:.2}") }
+}
+
+fn median_u64(mut samples: Vec<u64>) -> u64 {
+    samples.sort_unstable();
+    samples[samples.len() / 2]
+}
+
+#[derive(Clone, Copy, Default)]
+struct Mem {
+    rss_kb: u64,
+    alloc_bytes: u64,
+    alloc_count: u64,
+}
+
+fn parse_mem_json(stdout: &[u8]) -> Option<Mem> {
+    let text = std::str::from_utf8(stdout).ok()?.trim();
+    let line = text.lines().rev().find(|l| l.starts_with('{'))?;
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    Some(Mem {
+        rss_kb: v.get("rss_kb").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        alloc_bytes: v.get("alloc_bytes").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        alloc_count: v.get("alloc_count").and_then(serde_json::Value::as_u64).unwrap_or(0),
+    })
+}
+
+fn median_mem(samples: Vec<Mem>) -> Mem {
+    Mem {
+        rss_kb: median_u64(samples.iter().map(|s| s.rss_kb).collect()),
+        alloc_bytes: median_u64(samples.iter().map(|s| s.alloc_bytes).collect()),
+        alloc_count: median_u64(samples.iter().map(|s| s.alloc_count).collect()),
+    }
+}
+
+fn measure_child(repeats: usize, mut spawn: impl FnMut() -> Command) -> Option<Mem> {
+    let mut samples = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        let output = spawn().output().ok()?;
+        if !output.status.success() {
+            eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+            return None;
+        }
+        samples.push(parse_mem_json(&output.stdout)?);
+    }
+    Some(median_mem(samples))
+}
+
+fn python_script() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches/compare.py")
+}
+
+fn python_root() -> String {
+    std::env::var("PAGEINDEX_PYTHON").unwrap_or_else(|_| "/tmp/pageindex-upstream".into())
+}
+
+fn measure_python_mem(stage: &str, pdf: &Path, repeats: usize) -> Option<Mem> {
+    let script = python_script();
+    if !script.is_file() {
+        return None;
+    }
+    let upstream = python_root();
+    measure_child(repeats, || {
+        let mut cmd = Command::new("python3");
+        cmd.arg(&script)
+            .arg("--mem-one")
+            .arg(stage)
+            .arg("--path")
+            .arg(pdf)
+            .env("PYTHONPATH", &upstream)
+            .env("LITELLM_LOCAL_MODEL_COST_MAP", "True");
+        cmd
+    })
+}
+
+fn measure_rust_mem(exe: &Path, stage: &str, pdf: &Path, repeats: usize) -> Option<Mem> {
+    measure_child(repeats, || {
+        let mut cmd = Command::new(exe);
+        cmd.env("BENCH_MEM_ONE", stage).env("BENCH_MEM_PDF", pdf);
+        cmd
+    })
+}
+
+fn emit_mem_json() {
+    println!(
+        "{}",
+        serde_json::json!({
+            "rss_kb": peak_rss_kb(),
+            "alloc_bytes": ALLOC_PEAK.load(Ordering::Relaxed),
+            "alloc_count": ALLOC_COUNT.load(Ordering::Relaxed),
+        })
+    );
+}
+
+fn run_mem_child() -> bool {
+    let Ok(stage) = std::env::var("BENCH_MEM_ONE") else {
+        return false;
+    };
+    let path = PathBuf::from(std::env::var("BENCH_MEM_PDF").expect("BENCH_MEM_PDF"));
+    match stage.as_str() {
+        "parse" => rust_parse(&path),
+        "tree" => rust_tree(&path),
+        "e2e" => {
+            let rt = tokio::runtime::Runtime::new().expect("tokio");
+            rust_e2e(&rt, &path);
+        }
+        other => panic!("unknown BENCH_MEM_ONE stage {other}"),
+    }
+    emit_mem_json();
+    true
+}
+
 fn main() {
+    if run_mem_child() {
+        return;
+    }
+
     let repeats: usize = std::env::var("BENCH_REPEATS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
     let dir = tempfile::tempdir().expect("temp dir");
     let docs = write_docs(dir.path());
     let rt = tokio::runtime::Runtime::new().expect("tokio");
+    let exe = std::env::current_exe().expect("current_exe");
 
     let token_corpus: String = docs
         .iter()
@@ -249,5 +432,64 @@ fn main() {
             );
         }
         println!("\nToken counting: Rust {rust_tokens} tokens in {} ms.", cell(rust_token_ms));
+    }
+
+    println!("\n# Memory (fresh process per sample, median of {repeats})");
+    println!("Peak RSS is Linux VmHWM. Python heap is tracemalloc peak live bytes;");
+    println!("Rust heap is peak live bytes from the bench counting allocator.\n");
+
+    println!(
+        "| Document | Pages | Parse RSS py / rs (MB) | Tree RSS py / rs (MB) | E2E RSS py / rs (MB) | RSS ratio (tree) |"
+    );
+    println!("|---|---:|---:|---:|---:|---:|");
+
+    let mut heap_rows = Vec::new();
+    for (name, _parse_ms, _tree_ms, _e2e_ms, pages, _nodes) in &rust_rows {
+        let doc = docs.iter().find(|d| d.name == *name).expect("doc");
+        let rs_parse = measure_rust_mem(&exe, "parse", &doc.path, repeats);
+        let rs_tree = measure_rust_mem(&exe, "tree", &doc.path, repeats);
+        let rs_e2e = measure_rust_mem(&exe, "e2e", &doc.path, repeats);
+        let py_parse = measure_python_mem("parse", &doc.path, repeats);
+        let py_tree = measure_python_mem("tree", &doc.path, repeats);
+        let py_e2e = measure_python_mem("e2e", &doc.path, repeats);
+
+        let cell_rss = |py: Option<Mem>, rs: Option<Mem>| match (py, rs) {
+            (Some(p), Some(r)) => format!("{} / {}", mb(p.rss_kb), mb(r.rss_kb)),
+            (None, Some(r)) => format!("n/a / {}", mb(r.rss_kb)),
+            (Some(p), None) => format!("{} / n/a", mb(p.rss_kb)),
+            (None, None) => "n/a / n/a".into(),
+        };
+        let ratio = match (py_tree, rs_tree) {
+            (Some(p), Some(r)) if r.rss_kb > 0 => format!("{:.1}×", p.rss_kb as f64 / r.rss_kb as f64),
+            _ => "n/a".into(),
+        };
+        println!(
+            "| {name} | {pages} | {} | {} | {} | {} |",
+            cell_rss(py_parse, rs_parse),
+            cell_rss(py_tree, rs_tree),
+            cell_rss(py_e2e, rs_e2e),
+            ratio
+        );
+        heap_rows.push((*name, *pages, py_parse, rs_parse, py_tree, rs_tree, py_e2e, rs_e2e));
+    }
+
+    println!(
+        "\n| Document | Pages | Parse heap py / rs (MB) | Tree heap py / rs (MB) | E2E heap py / rs (MB) | Rust allocs (tree) |"
+    );
+    println!("|---|---:|---:|---:|---:|---:|");
+    for (name, pages, py_parse, rs_parse, py_tree, rs_tree, py_e2e, rs_e2e) in heap_rows {
+        let cell_heap = |py: Option<Mem>, rs: Option<Mem>| match (py, rs) {
+            (Some(p), Some(r)) => format!("{} / {}", heap_mb(p.alloc_bytes), heap_mb(r.alloc_bytes)),
+            (None, Some(r)) => format!("n/a / {}", heap_mb(r.alloc_bytes)),
+            (Some(p), None) => format!("{} / n/a", heap_mb(p.alloc_bytes)),
+            (None, None) => "n/a / n/a".into(),
+        };
+        let allocs = rs_tree.map(|m| m.alloc_count.to_string()).unwrap_or_else(|| "n/a".into());
+        println!(
+            "| {name} | {pages} | {} | {} | {} | {allocs} |",
+            cell_heap(py_parse, rs_parse),
+            cell_heap(py_tree, rs_tree),
+            cell_heap(py_e2e, rs_e2e),
+        );
     }
 }
