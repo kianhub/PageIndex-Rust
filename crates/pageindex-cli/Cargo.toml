@@ -1,0 +1,22 @@
+[package]
+name = "pageindex-cli"
+description = "Command-line indexer equivalent to PageIndex's run_pageindex.py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pageindex"
+path = "src/main.rs"
+
+[dependencies]
+pageindex.workspace = true
+clap = { version = "4", features = ["derive"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
