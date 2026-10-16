@@ -10,6 +10,7 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         .current_dir(dir)
         .env("OPENAI_API_KEY", "")
         .env("CHATGPT_API_KEY", "")
+        .env("PAGEINDEX_CONFIG_DIR", dir.join("cfg"))
         .output()
         .unwrap()
 }
@@ -92,4 +93,29 @@ fn flag_combinations_are_validated() {
         assert!(!out.status.success());
         assert!(stderr(&out).contains(message), "{args:?}: {}", stderr(&out));
     }
+}
+
+#[test]
+fn chatgpt_status_and_help() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(dir.path(), &["chatgpt", "status"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Not signed in with ChatGPT"), "{stdout}");
+    let out = run(dir.path(), &["chatgpt", "logout"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = run(dir.path(), &["--help"]);
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("chatgpt"), "{help}");
+}
+
+#[test]
+fn chatgpt_flag_needs_login_not_an_api_key() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("report.pdf"), common::report_pdf()).unwrap();
+    let out = run(dir.path(), &["--pdf_path", "report.pdf", "--chatgpt", "--optimize", "off"]);
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("chatgpt login") || err.contains("Not signed in"), "{err}");
+    assert!(!err.contains("OPENAI_API_KEY"), "{err}");
 }

@@ -4,19 +4,47 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use pageindex::chatgpt::{ChatGptClient, chatgpt_model, open_browser, redact_authorize_url};
 use pageindex::classic::{ClassicOptions, page_index};
 use pageindex::config::parse_yes_no;
 use pageindex::flash::{FlashOptions, flash_rejection_reason, page_index_flash};
 use pageindex::markdown::{MdOptions, md_to_tree};
 use pageindex::summary::SUMMARY_MAX_WORDS;
 use pageindex::tree_optimize::EXPAND_CONCURRENCY;
-use pageindex::{ConfigLoader, ConfigOverrides, LiteLlm, LlmClient, OptimizeMode};
+use pageindex::{Config, ConfigLoader, ConfigOverrides, LiteLlm, LlmClient, OptimizeMode};
 
 #[derive(Debug, Parser)]
 #[command(name = "pageindex", about = "Process PDF or Markdown document and generate structure")]
-struct Args {
+#[command(args_conflicts_with_subcommands = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+    #[command(flatten)]
+    index: IndexArgs,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Opt-in Sign in with ChatGPT (plan usage via the Responses API)
+    #[command(subcommand)]
+    Chatgpt(ChatgptAction),
+}
+
+#[derive(Debug, Subcommand)]
+enum ChatgptAction {
+    /// Continue with ChatGPT (PKCE loopback login)
+    Login,
+    /// Revoke the session and clear local tokens
+    Logout,
+    /// Show whether ChatGPT plan usage is connected
+    Status,
+}
+
+#[derive(Debug, clap::Args)]
+struct IndexArgs {
     /// Path to the PDF file
     #[arg(long = "pdf_path", alias = "pdf-path")]
     pdf_path: Option<PathBuf>,
@@ -93,9 +121,12 @@ struct Args {
     /// Token threshold for generating summaries (markdown only)
     #[arg(long = "summary-token-threshold", default_value_t = 200)]
     summary_token_threshold: usize,
+    /// Use Sign in with ChatGPT (`chatgpt/` models) instead of an API key
+    #[arg(long)]
+    chatgpt: bool,
 }
 
-impl Args {
+impl IndexArgs {
     fn flag(on: bool, off: bool) -> Option<bool> {
         match (on, off) {
             (true, _) => Some(true),
@@ -188,7 +219,46 @@ fn write_result(input: &Path, value: &impl serde::Serialize) -> Result<PathBuf, 
     Ok(out)
 }
 
-async fn run_pdf(args: &Args, pdf: &Path) -> Result<(), String> {
+fn apply_chatgpt(config: &mut Config) -> Result<(), String> {
+    config.index_model = chatgpt_model(&config.index_model).map_err(|e| e.to_string())?;
+    config.summary_model = chatgpt_model(&config.summary_model).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn chatgpt_cmd(action: ChatgptAction) -> Result<(), String> {
+    let client = ChatGptClient::from_env();
+    match action {
+        ChatgptAction::Status => {
+            println!("{}", client.status().map_err(|e| e.to_string())?.render());
+            Ok(())
+        }
+        ChatgptAction::Logout => {
+            let out = client.logout().await.map_err(|e| e.to_string())?;
+            println!("{}", out.message);
+            Ok(())
+        }
+        ChatgptAction::Login => {
+            println!("Continue with ChatGPT");
+            let flow = client.begin_login().await.map_err(|e| e.to_string())?;
+            let printable = redact_authorize_url(&flow.authorize_url);
+            if open_browser(&flow.authorize_url).is_err() {
+                println!("Open this URL in your browser:\n{printable}");
+            } else {
+                println!("If the browser does not open, visit:\n{printable}");
+            }
+            println!("Waiting for the loopback callback on {} …", flow.redirect_uri);
+            let account = flow.finish(&client, Duration::from_secs(600)).await.map_err(|e| e.to_string())?;
+            let who = account.email.as_deref().unwrap_or("ChatGPT");
+            println!("Signed in as {who}.");
+            if !account.plan_usage_enabled() {
+                println!("ChatGPT plan usage was not granted. Re-run login and approve it, or set OPENAI_API_KEY.");
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn run_pdf(args: &IndexArgs, pdf: &Path) -> Result<(), String> {
     let has_pdf_ext = pdf.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
     if !has_pdf_ext {
         return Err("PDF file must have .pdf extension".into());
@@ -197,7 +267,10 @@ async fn run_pdf(args: &Args, pdf: &Path) -> Result<(), String> {
         return Err(format!("PDF file not found: {}", pdf.display()));
     }
     if args.mode == "standard" {
-        let config = ConfigLoader::new().load(&args.overrides());
+        let mut config = ConfigLoader::new().load(&args.overrides());
+        if args.chatgpt {
+            apply_chatgpt(&mut config)?;
+        }
         let llm = LiteLlm::new();
         let result = page_index(
             pdf,
@@ -220,12 +293,15 @@ async fn run_pdf(args: &Args, pdf: &Path) -> Result<(), String> {
         println!("Tree structure saved to: {}", out.display());
         return Ok(());
     }
-    let config = ConfigLoader::new().load(&ConfigOverrides {
+    let mut config = ConfigLoader::new().load(&ConfigOverrides {
         summary_model: args.summary_model.clone(),
         index_model: args.index_model.clone(),
         model: args.model.clone(),
         ..Default::default()
     });
+    if args.chatgpt {
+        apply_chatgpt(&mut config)?;
+    }
     let optimize = match args.optimize.as_deref() {
         None | Some("full") => OptimizeMode::Full,
         Some("merge") => OptimizeMode::Merge,
@@ -261,7 +337,7 @@ async fn run_pdf(args: &Args, pdf: &Path) -> Result<(), String> {
     Ok(())
 }
 
-async fn run_markdown(args: &Args, md: &Path) -> Result<(), String> {
+async fn run_markdown(args: &IndexArgs, md: &Path) -> Result<(), String> {
     let ext = md.extension().map(|e| e.to_string_lossy().to_lowercase());
     if !matches!(ext.as_deref(), Some("md" | "markdown")) {
         return Err("Markdown file must have .md or .markdown extension".into());
@@ -270,7 +346,10 @@ async fn run_markdown(args: &Args, md: &Path) -> Result<(), String> {
         return Err(format!("Markdown file not found: {}", md.display()));
     }
     println!("Processing markdown file...");
-    let config = ConfigLoader::new().load(&args.overrides());
+    let mut config = ConfigLoader::new().load(&args.overrides());
+    if args.chatgpt {
+        apply_chatgpt(&mut config)?;
+    }
     let yes = |v: &Option<String>| v.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("yes"));
     let opts = MdOptions {
         if_thinning: args.if_thinning.eq_ignore_ascii_case("yes"),
@@ -293,14 +372,19 @@ async fn run_markdown(args: &Args, md: &Path) -> Result<(), String> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let mut args = Args::parse();
-    let outcome = match args.validate() {
-        Err(err) => Err(err),
-        Ok(()) => match (args.pdf_path.clone(), args.md_path.clone()) {
-            (Some(pdf), _) => run_pdf(&args, &pdf).await,
-            (_, Some(md)) => run_markdown(&args, &md).await,
-            _ => unreachable!("validate requires one input"),
-        },
+    let cli = Cli::parse();
+    let outcome = if let Some(Command::Chatgpt(action)) = cli.command {
+        chatgpt_cmd(action).await
+    } else {
+        let mut args = cli.index;
+        match args.validate() {
+            Err(err) => Err(err),
+            Ok(()) => match (args.pdf_path.clone(), args.md_path.clone()) {
+                (Some(pdf), _) => run_pdf(&args, &pdf).await,
+                (_, Some(md)) => run_markdown(&args, &md).await,
+                _ => unreachable!("validate requires one input"),
+            },
+        }
     };
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
