@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
+use pageindex::classic::{ClassicOptions, page_index};
 use pageindex::config::parse_yes_no;
 use pageindex::flash::{FlashOptions, flash_rejection_reason, page_index_flash};
 use pageindex::markdown::{MdOptions, md_to_tree};
@@ -195,8 +196,29 @@ async fn run_pdf(args: &Args, pdf: &Path) -> Result<(), String> {
     if !pdf.is_file() {
         return Err(format!("PDF file not found: {}", pdf.display()));
     }
-    if args.mode != "flash" {
-        return Err("--mode standard (the LLM-built tree) is not available in this build yet; use --mode flash".into());
+    if args.mode == "standard" {
+        let config = ConfigLoader::new().load(&args.overrides());
+        let llm = LiteLlm::new();
+        let result = page_index(
+            pdf,
+            ClassicOptions {
+                model: Some(config.index_model),
+                toc_check_page_num: args.toc_check_pages,
+                max_page_num_each_node: args.max_pages_per_node,
+                max_token_num_each_node: args.max_tokens_per_node,
+                if_add_node_id: args.if_add_node_id.as_deref().and_then(parse_yes_no),
+                if_add_node_summary: args.if_add_node_summary.as_deref().and_then(parse_yes_no),
+                if_add_doc_description: args.if_add_doc_description.as_deref().and_then(parse_yes_no),
+                if_add_node_text: args.if_add_node_text.as_deref().and_then(parse_yes_no),
+            },
+            &llm,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        println!("Parsing done, saving to file...");
+        let out = write_result(pdf, &result)?;
+        println!("Tree structure saved to: {}", out.display());
+        return Ok(());
     }
     let config = ConfigLoader::new().load(&ConfigOverrides {
         summary_model: args.summary_model.clone(),

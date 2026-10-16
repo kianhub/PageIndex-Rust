@@ -7,15 +7,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use crate::agent::AgentBackend;
+use crate::classic::{ClassicOptions, page_index};
+use crate::cloud::PageIndexCloudClient;
 use crate::config::{ConfigLoader, ConfigOverrides};
 use crate::error::{ErrorKind, PageIndexError, Result};
 use crate::flash::{FlashOptions, flash_rejection_reason, page_index_flash};
-use crate::llm::{LiteLlm, LlmClient};
+use crate::llm::{ChatMessage, LiteLlm, LlmClient};
 use crate::naming::{MAX_NAME_BYTES, sanitize_filename, truncate_filename};
 use crate::store::{DocMeta, DocStore, StoredPage};
 use crate::summary::generate_doc_description;
 use crate::tree::{Node, add_node_text, write_node_ids};
-use crate::types::{LocalIndexConfig, OptimizeMode};
+use crate::types::{ChatProcessOptions, LocalIndexConfig, OptimizeMode};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SubmitResult {
@@ -31,6 +34,8 @@ pub struct Envelope<T> {
     pub retrieval_ready: bool,
     pub result: T,
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    pub features: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -76,6 +81,9 @@ pub struct PageIndexLocalClient {
     summary_model: String,
     config: LocalIndexConfig,
     llm: Arc<dyn LlmClient>,
+    pub chat_model: String,
+    pub chat_backend: Option<crate::types::Backend>,
+    pub instructions: Option<String>,
 }
 
 impl PageIndexLocalClient {
@@ -93,8 +101,16 @@ impl PageIndexLocalClient {
             Some(backend) => Arc::new(LiteLlm::with_backend(backend.clone())),
             None => Arc::new(LiteLlm::new()),
         };
-        let root = config.storage_path.clone().unwrap_or_else(|| PathBuf::from("./pageindex_store"));
-        Self { store: DocStore::new(root), summary_model: resolved.summary_model, config, llm }
+        let root = config.storage_path.clone().unwrap_or_else(|| PathBuf::from("./.pageindex"));
+        Self {
+            store: DocStore::new(root),
+            summary_model: resolved.summary_model,
+            chat_model: resolved.chat_model,
+            chat_backend: config.backend.clone(),
+            instructions: None,
+            config,
+            llm,
+        }
     }
 
     /// Use this model client for every indexing call.
@@ -123,12 +139,7 @@ impl PageIndexLocalClient {
     /// which gains a `_N` suffix when the name is taken.
     pub async fn submit_document(&self, file_path: impl AsRef<Path>, options: SubmitOptions) -> Result<SubmitResult> {
         let mode = options.mode.as_deref().unwrap_or("flash");
-        if mode == "standard" {
-            return Err(PageIndexError::api(
-                "Failed to submit document: standard mode is not available in this build yet; use mode='flash'.",
-            ));
-        }
-        if mode != "flash" {
+        if mode != "flash" && mode != "standard" {
             return Err(PageIndexError::api(format!(
                 "Failed to submit document: unknown local processing mode {mode:?}. Supported: 'flash' (default) or 'standard'."
             )));
@@ -142,34 +153,67 @@ impl PageIndexLocalClient {
         if !doc_name.to_lowercase().ends_with(".pdf") {
             return Err(PageIndexError::api("Failed to submit document: only PDF files are supported in local mode."));
         }
-        let flash = FlashOptions {
-            summary: true,
-            summary_model: Some(self.summary_model.clone()),
-            optimize: self.config.optimize.unwrap_or(OptimizeMode::Full),
-            optimize_model: Some(self.summary_model.clone()),
-            summary_concurrency: self.config.summary_concurrency,
-            use_embedded_toc: self.config.use_embedded_toc.unwrap_or(true),
-            summary_max_words: self.config.summary_max_words,
-            summary_reasoning_effort: self.config.summary_reasoning_effort.clone(),
-            llm: Some(self.llm.clone()),
+        let (mut structure, page_texts, description) = if mode == "standard" {
+            if self.config.summary_max_words.is_some()
+                || self.config.summary_concurrency.is_some()
+                || self.config.summary_reasoning_effort.is_some()
+            {
+                return Err(PageIndexError::api(
+                    "Failed to submit document: summary_max_words / summary_concurrency / summary_reasoning_effort are flash-only; omit them for mode='standard'.",
+                ));
+            }
+            let result = page_index(
+                path,
+                ClassicOptions {
+                    model: self.config.model.clone(),
+                    if_add_node_id: Some(true),
+                    if_add_node_summary: Some(true),
+                    if_add_doc_description: Some(true),
+                    ..Default::default()
+                },
+                self.llm.as_ref(),
+            )
+            .await
+            .map_err(|e| match e.kind {
+                ErrorKind::NotFound => e,
+                _ => {
+                    PageIndexError::api(format!("Failed to submit document: {}", e.message)).with_status(e.status_code)
+                }
+            })?;
+            let description = result.doc_description.unwrap_or_default();
+            (result.structure, result.page_texts, description)
+        } else {
+            let flash = FlashOptions {
+                summary: true,
+                summary_model: Some(self.summary_model.clone()),
+                optimize: self.config.optimize.unwrap_or(OptimizeMode::Full),
+                optimize_model: Some(self.summary_model.clone()),
+                summary_concurrency: self.config.summary_concurrency,
+                use_embedded_toc: self.config.use_embedded_toc.unwrap_or(true),
+                summary_max_words: self.config.summary_max_words,
+                summary_reasoning_effort: self.config.summary_reasoning_effort.clone(),
+                llm: Some(self.llm.clone()),
+            };
+            let result = page_index_flash(path, &flash).await.map_err(|e| match e.kind {
+                ErrorKind::NotFound => e,
+                _ => {
+                    PageIndexError::api(format!("Failed to submit document: {}", e.message)).with_status(e.status_code)
+                }
+            })?;
+            if !result.page_texts.iter().any(|t| !t.trim().is_empty()) {
+                return Err(PageIndexError::api("Failed to submit document: PDF has no content. All pages are blank."));
+            }
+            if let Some(reason) = flash_rejection_reason(&result.structure, result.toc_source, "mode='standard'") {
+                return Err(PageIndexError::api(format!("Failed to submit document: {reason}")));
+            }
+            let mut structure = result.structure;
+            write_node_ids(&mut structure);
+            let description = generate_doc_description(&structure, self.llm.as_ref(), &self.summary_model).await?;
+            (structure, result.page_texts, description)
         };
-        let result = page_index_flash(path, &flash).await.map_err(|e| match e.kind {
-            ErrorKind::NotFound => e,
-            _ => PageIndexError::api(format!("Failed to submit document: {}", e.message)).with_status(e.status_code),
-        })?;
-        if !result.page_texts.iter().any(|t| !t.trim().is_empty()) {
-            return Err(PageIndexError::api("Failed to submit document: PDF has no content. All pages are blank."));
-        }
-        if let Some(reason) = flash_rejection_reason(&result.structure, result.toc_source, "mode='standard'") {
-            return Err(PageIndexError::api(format!("Failed to submit document: {reason}")));
-        }
-        let mut structure = result.structure;
-        write_node_ids(&mut structure);
-        let description = generate_doc_description(&structure, self.llm.as_ref(), &self.summary_model).await?;
-        let page_count = result.page_texts.len();
+        let page_count = page_texts.len();
         check_page_bounds(&structure, page_count)?;
-        let pages: Vec<StoredPage> = result
-            .page_texts
+        let pages: Vec<StoredPage> = page_texts
             .into_iter()
             .enumerate()
             .map(|(i, markdown)| StoredPage { page_index: i + 1, markdown })
@@ -304,6 +348,242 @@ impl PageIndexLocalClient {
     pub fn is_retrieval_ready(&self, doc_id: &str) -> bool {
         self.store.get_meta(doc_id).is_some_and(|m| m.status == "completed")
     }
+
+    /// The stored id for an exact document name.
+    pub fn get_document_id(&self, name: &str) -> Result<String> {
+        self.store
+            .list_metas()
+            .into_iter()
+            .find(|m| m.name == name)
+            .map(|m| m.id)
+            .ok_or_else(|| PageIndexError::api(format!("Document not found: {name}")).with_status(Some(404)))
+    }
+
+    pub fn with_instructions(mut self, text: impl Into<String>) -> Self {
+        self.instructions = Some(text.into());
+        self
+    }
+
+    pub fn with_chat_model(mut self, model: impl Into<String>) -> Self {
+        self.chat_model = model.into();
+        self
+    }
+
+    /// Own-model document QA over the local store.
+    pub async fn chat(&self, messages: Vec<ChatMessage>, doc_id: Vec<String>, citations: bool) -> Result<String> {
+        let req = crate::chat::ChatRequest {
+            messages,
+            doc_id,
+            citations,
+            model: self.chat_model.clone(),
+            ..crate::chat::ChatRequest::new(&self.chat_model, Vec::new())
+        };
+        let value = crate::chat::run_chat_completions(self, self.llm.as_ref(), &req, false).await?;
+        Ok(value.pointer("/choices/0/message/content").and_then(serde_json::Value::as_str).unwrap_or("").to_owned())
+    }
+
+    pub async fn chat_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        doc_id: Vec<String>,
+        show_process: ChatProcessOptions,
+    ) -> Result<crate::chat_stream::ChatStream> {
+        let mut req = crate::chat::ChatRequest::new(&self.chat_model, messages);
+        req.doc_id = doc_id;
+        req.show_process = show_process;
+        crate::chat::run_chat_stream(self, self.llm.as_ref(), &req).await
+    }
+
+    pub async fn chat_completions(&self, messages: Vec<ChatMessage>, doc_id: Vec<String>) -> Result<serde_json::Value> {
+        let mut req = crate::chat::ChatRequest::new(&self.chat_model, messages);
+        req.doc_id = doc_id;
+        crate::chat::run_chat_completions(self, self.llm.as_ref(), &req, false).await
+    }
+
+    pub async fn agent_instructions(&self, include_management: bool) -> Result<String> {
+        crate::agent::base_instructions(self, include_management).await
+    }
+
+    pub fn agent_tools(&self, include_management: bool) -> serde_json::Value {
+        crate::agent::as_openai_tools(include_management, false, None, crate::agent::PAGEINDEX_BASE_URL)
+    }
+
+    pub async fn citation_prompt(&self, format: &str) -> Result<String> {
+        crate::agent::fetch_citation_prompt(self, format).await
+    }
+
+    pub async fn get_citations(&self, answer: &str, doc_id: Option<&[String]>) -> Result<Vec<serde_json::Value>> {
+        crate::agent::get_citations(self, answer, doc_id).await
+    }
+
+    pub async fn resolve_citations(&self, answer: &str, doc_id: Option<&[String]>) -> Result<serde_json::Value> {
+        crate::agent::resolve_citations(self, answer, doc_id).await
+    }
+
+    pub fn as_openai_tools(&self, include_management: bool) -> serde_json::Value {
+        crate::agent::as_openai_tools(include_management, false, None, crate::agent::PAGEINDEX_BASE_URL)
+    }
+
+    pub fn as_anthropic_tools(&self, include_management: bool) -> serde_json::Value {
+        crate::agent::as_anthropic_tools(include_management)
+    }
+
+    pub fn as_claude_mcp(&self, include_management: bool) -> serde_json::Value {
+        crate::agent::as_claude_mcp(include_management, None, crate::agent::PAGEINDEX_BASE_URL)
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentBackend for PageIndexLocalClient {
+    fn api_key(&self) -> Option<&str> {
+        None
+    }
+
+    fn instructions(&self) -> Option<&str> {
+        self.instructions.as_deref()
+    }
+
+    async fn list_documents(&self, limit: usize, offset: usize) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(PageIndexLocalClient::list_documents(self, limit, offset, None)?)?)
+    }
+
+    async fn get_document(&self, doc_id: &str) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(PageIndexLocalClient::get_document(self, doc_id)?)?)
+    }
+
+    async fn get_tree(&self, doc_id: &str, node_summary: bool, include_text: bool) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(PageIndexLocalClient::get_tree(self, doc_id, node_summary, include_text)?)?)
+    }
+
+    async fn get_ocr_pages(&self, doc_id: &str) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(self.get_ocr(doc_id, OcrFormat::Page)?)?)
+    }
+
+    async fn delete_document(&self, doc_id: &str) -> Result<()> {
+        PageIndexLocalClient::delete_document(self, doc_id)
+    }
+}
+
+/// Unified local/cloud client. Documents live on one side; chat may use
+/// your own model on either side.
+pub enum PageIndexClient {
+    Local(Box<PageIndexLocalClient>),
+    Cloud(Box<PageIndexCloudClient>),
+}
+
+impl PageIndexClient {
+    pub fn local(config: LocalIndexConfig) -> Self {
+        Self::Local(Box::new(PageIndexLocalClient::with_config(config)))
+    }
+
+    pub fn cloud(api_key: impl Into<String>) -> Self {
+        Self::Cloud(Box::new(PageIndexCloudClient::new(api_key)))
+    }
+
+    pub fn from_env_cloud() -> Result<Self> {
+        Ok(Self::Cloud(Box::new(PageIndexCloudClient::from_env()?)))
+    }
+
+    /// Local documents and your own chat model — the default constructor.
+    pub fn new() -> Self {
+        Self::local(LocalIndexConfig::default())
+    }
+
+    pub fn with_llm(self, llm: Arc<dyn LlmClient>) -> Self {
+        match self {
+            Self::Local(local) => Self::Local(Box::new(local.with_llm(llm))),
+            other => other,
+        }
+    }
+
+    pub fn backend(&self) -> &dyn AgentBackend {
+        match self {
+            Self::Local(local) => local.as_ref(),
+            Self::Cloud(cloud) => cloud.as_ref(),
+        }
+    }
+
+    pub async fn submit_document(
+        &self,
+        file_path: impl AsRef<Path>,
+        options: SubmitOptions,
+    ) -> Result<serde_json::Value> {
+        match self {
+            Self::Local(local) => Ok(serde_json::to_value(local.submit_document(file_path, options).await?)?),
+            Self::Cloud(cloud) => {
+                cloud
+                    .api
+                    .submit_document(
+                        file_path,
+                        options.mode.as_deref(),
+                        None,
+                        None,
+                        options.metadata.as_ref().map(|m| serde_json::Value::Object(m.clone())).as_ref(),
+                    )
+                    .await
+            }
+        }
+    }
+
+    pub async fn chat(&self, messages: Vec<ChatMessage>, doc_id: Vec<String>, citations: bool) -> Result<String> {
+        match self {
+            Self::Local(local) => local.chat(messages, doc_id, citations).await,
+            Self::Cloud(cloud) => {
+                if let Some(model) = &cloud.chat_model {
+                    let llm = match &cloud.chat_backend {
+                        Some(backend) => LiteLlm::with_backend(backend.clone()),
+                        None => LiteLlm::new(),
+                    };
+                    let mut req = crate::chat::ChatRequest::new(model, messages);
+                    req.doc_id = doc_id;
+                    req.citations = citations;
+                    let value = crate::chat::run_chat_completions(cloud.as_ref(), &llm, &req, false).await?;
+                    Ok(value
+                        .pointer("/choices/0/message/content")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned())
+                } else {
+                    let payload = serde_json::json!({
+                        "messages": messages.iter().map(|m| serde_json::json!({"role": m.role, "content": m.content})).collect::<Vec<_>>(),
+                        "stream": false,
+                        "doc_id": if doc_id.len() == 1 { serde_json::json!(doc_id[0]) } else { serde_json::json!(doc_id) },
+                        "enable_citations": citations,
+                    });
+                    let response = cloud.api.chat_completions(&payload, false).await?;
+                    Ok(response
+                        .pointer("/choices/0/message/content")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned())
+                }
+            }
+        }
+    }
+
+    pub async fn submit_query(&self, doc_id: &str, query: &str, thinking: bool) -> Result<serde_json::Value> {
+        match self {
+            Self::Cloud(cloud) => cloud.api.submit_query(doc_id, query, thinking).await,
+            Self::Local(_) => Err(PageIndexError::api(
+                "submit_query is cloud-only — the retrieval API is deprecated in favor of chat completions; use chat() instead.",
+            )),
+        }
+    }
+
+    pub async fn get_retrieval(&self, retrieval_id: &str) -> Result<serde_json::Value> {
+        match self {
+            Self::Cloud(cloud) => cloud.api.get_retrieval(retrieval_id).await,
+            Self::Local(_) => Err(PageIndexError::api(
+                "get_retrieval is cloud-only — the retrieval API is deprecated in favor of chat completions; use chat() instead.",
+            )),
+        }
+    }
+}
+
+impl Default for PageIndexClient {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn envelope<T>(doc_id: &str, result: T, meta: DocMeta) -> Envelope<T> {
@@ -313,6 +593,7 @@ fn envelope<T>(doc_id: &str, result: T, meta: DocMeta) -> Envelope<T> {
         retrieval_ready: true,
         result,
         metadata: meta.metadata,
+        features: serde_json::Map::new(),
     }
 }
 

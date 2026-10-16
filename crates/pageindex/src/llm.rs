@@ -15,14 +15,53 @@ use crate::error::{ErrorKind, PageIndexError, Result};
 use crate::types::Backend;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    pub name: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
 }
 
 impl ChatMessage {
+    pub fn system(content: impl Into<String>) -> Self {
+        Self { role: "system".into(), content: content.into(), ..Self::default() }
+    }
+
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: content.into() }
+        Self { role: "user".into(), content: content.into(), ..Self::default() }
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self { role: "assistant".into(), content: content.into(), ..Self::default() }
+    }
+
+    pub fn assistant_tools(tool_calls: Vec<ToolCall>) -> Self {
+        Self { role: "assistant".into(), tool_calls, ..Self::default() }
+    }
+
+    pub fn tool(tool_call_id: impl Into<String>, name: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".into(),
+            content: content.into(),
+            name: Some(name.into()),
+            tool_call_id: Some(tool_call_id.into()),
+            ..Self::default()
+        }
     }
 }
 
@@ -31,12 +70,33 @@ pub struct CompletionParams {
     /// Sent where the provider supports it, dropped elsewhere.
     pub reasoning_effort: Option<String>,
     pub max_tokens: Option<u32>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Completion {
+    pub text: String,
+    pub tool_calls: Vec<ToolCall>,
+    pub finished: bool,
 }
 
 /// One chat completion. Errors carry the HTTP status when there was one.
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     async fn complete(&self, model: &str, messages: &[ChatMessage], params: &CompletionParams) -> Result<String>;
+
+    /// One model turn, optionally with tools. The default implementation
+    /// ignores tools and returns [`complete`].
+    async fn complete_turn(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        params: &CompletionParams,
+        _tools: &[ToolSpec],
+    ) -> Result<Completion> {
+        Ok(Completion { text: self.complete(model, messages, params).await?, tool_calls: Vec::new(), finished: true })
+    }
 }
 
 pub const MAX_RETRIES: usize = 10;
@@ -276,18 +336,37 @@ impl LiteLlm {
 #[async_trait]
 impl LlmClient for LiteLlm {
     async fn complete(&self, model: &str, messages: &[ChatMessage], params: &CompletionParams) -> Result<String> {
+        self.complete_turn(model, messages, params, &[]).await.map(|c| c.text)
+    }
+
+    async fn complete_turn(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        params: &CompletionParams,
+        tools: &[ToolSpec],
+    ) -> Result<Completion> {
         let (provider_name, wire_model) = route(model)?;
         let provider = PROVIDERS.iter().find(|p| p.name == provider_name).expect("routed provider exists");
         let (base, key) = self.credentials(provider)?;
-        let msgs: Vec<Value> = messages.iter().map(|m| json!({"role": m.role, "content": m.content})).collect();
         let request = match provider.wire {
             Wire::OpenAi => {
+                let msgs: Vec<Value> = messages.iter().map(openai_message).collect();
                 let mut body = json!({"model": wire_model, "messages": msgs});
                 if let (Some(effort), true) = (&params.reasoning_effort, provider.reasoning_effort) {
                     body["reasoning_effort"] = json!(effort);
                 }
                 if let Some(max) = params.max_tokens {
                     body["max_tokens"] = json!(max);
+                }
+                if let Some(t) = params.temperature {
+                    body["temperature"] = json!(t);
+                }
+                if let Some(p) = params.top_p {
+                    body["top_p"] = json!(p);
+                }
+                if !tools.is_empty() {
+                    body["tools"] = Value::Array(tools.iter().map(openai_tool).collect());
                 }
                 merge_extra(&mut body, self.backend.as_ref());
                 let mut req = self.http.post(format!("{base}/chat/completions")).json(&body);
@@ -299,15 +378,20 @@ impl LlmClient for LiteLlm {
             Wire::Anthropic => {
                 let system: Vec<&str> =
                     messages.iter().filter(|m| m.role == "system").map(|m| m.content.as_str()).collect();
-                let msgs: Vec<Value> = messages
-                    .iter()
-                    .filter(|m| m.role != "system")
-                    .map(|m| json!({"role": m.role, "content": m.content}))
-                    .collect();
+                let msgs: Vec<Value> = anthropic_messages(messages);
                 let mut body =
                     json!({"model": wire_model, "messages": msgs, "max_tokens": params.max_tokens.unwrap_or(8192)});
                 if !system.is_empty() {
                     body["system"] = json!(system.join("\n\n"));
+                }
+                if let Some(t) = params.temperature {
+                    body["temperature"] = json!(t);
+                }
+                if let Some(p) = params.top_p {
+                    body["top_p"] = json!(p);
+                }
+                if !tools.is_empty() {
+                    body["tools"] = Value::Array(tools.iter().map(anthropic_tool).collect());
                 }
                 merge_extra(&mut body, self.backend.as_ref());
                 self.http
@@ -332,14 +416,136 @@ impl LlmClient for LiteLlm {
             return Err(PageIndexError::new(ErrorKind::Llm, format!("{provider_name} returned {status}: {detail}"))
                 .with_status(Some(status.as_u16())));
         }
-        let text = match provider.wire {
-            Wire::OpenAi => payload.pointer("/choices/0/message/content").and_then(Value::as_str).map(str::to_owned),
-            Wire::Anthropic => payload.get("content").and_then(Value::as_array).map(|blocks| {
-                blocks.iter().filter_map(|b| b.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("")
-            }),
-        };
-        Ok(text.unwrap_or_default())
+        Ok(match provider.wire {
+            Wire::OpenAi => parse_openai_completion(&payload),
+            Wire::Anthropic => parse_anthropic_completion(&payload),
+        })
     }
+}
+
+fn openai_message(message: &ChatMessage) -> Value {
+    if message.role == "tool" {
+        return json!({
+            "role": "tool",
+            "tool_call_id": message.tool_call_id,
+            "content": message.content,
+        });
+    }
+    if !message.tool_calls.is_empty() {
+        let calls: Vec<Value> = message
+            .tool_calls
+            .iter()
+            .map(|c| {
+                json!({
+                    "id": c.id,
+                    "type": "function",
+                    "function": {"name": c.name, "arguments": c.arguments},
+                })
+            })
+            .collect();
+        let mut body = json!({"role": "assistant", "tool_calls": calls});
+        if !message.content.is_empty() {
+            body["content"] = json!(message.content);
+        }
+        return body;
+    }
+    json!({"role": message.role, "content": message.content})
+}
+
+fn openai_tool(spec: &ToolSpec) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": spec.parameters,
+        }
+    })
+}
+
+fn anthropic_tool(spec: &ToolSpec) -> Value {
+    json!({
+        "name": spec.name,
+        "description": spec.description,
+        "input_schema": spec.parameters,
+    })
+}
+
+fn anthropic_messages(messages: &[ChatMessage]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for message in messages.iter().filter(|m| m.role != "system") {
+        if message.role == "tool" {
+            let block = json!({
+                "type": "tool_result",
+                "tool_use_id": message.tool_call_id,
+                "content": message.content,
+            });
+            if let Some(Value::Array(content)) = out.last_mut().and_then(|m: &mut Value| {
+                if m.get("role").and_then(Value::as_str) == Some("user") { m.get_mut("content") } else { None }
+            }) {
+                content.push(block);
+            } else {
+                out.push(json!({"role": "user", "content": [block]}));
+            }
+            continue;
+        }
+        if !message.tool_calls.is_empty() {
+            let mut content = Vec::new();
+            if !message.content.is_empty() {
+                content.push(json!({"type": "text", "text": message.content}));
+            }
+            for call in &message.tool_calls {
+                let input: Value = serde_json::from_str(&call.arguments).unwrap_or(json!({}));
+                content.push(json!({"type": "tool_use", "id": call.id, "name": call.name, "input": input}));
+            }
+            out.push(json!({"role": "assistant", "content": content}));
+            continue;
+        }
+        let role = if message.role == "tool" { "user" } else { message.role.as_str() };
+        out.push(json!({"role": role, "content": message.content}));
+    }
+    out
+}
+
+fn parse_openai_completion(payload: &Value) -> Completion {
+    let message = payload.pointer("/choices/0/message");
+    let text = message.and_then(|m| m.get("content")).and_then(Value::as_str).unwrap_or("").to_owned();
+    let tool_calls = message
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(Value::as_array)
+        .map(|calls| {
+            calls
+                .iter()
+                .filter_map(|c| {
+                    Some(ToolCall {
+                        id: c.get("id").and_then(Value::as_str)?.to_owned(),
+                        name: c.pointer("/function/name").and_then(Value::as_str)?.to_owned(),
+                        arguments: c.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("{}").to_owned(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let finish = payload.pointer("/choices/0/finish_reason").and_then(Value::as_str);
+    Completion { text, tool_calls, finished: !matches!(finish, Some("length" | "max_tokens")) }
+}
+
+fn parse_anthropic_completion(payload: &Value) -> Completion {
+    let blocks = payload.get("content").and_then(Value::as_array).cloned().unwrap_or_default();
+    let text = blocks.iter().filter_map(|b| b.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("");
+    let tool_calls = blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .filter_map(|b| {
+            Some(ToolCall {
+                id: b.get("id").and_then(Value::as_str)?.to_owned(),
+                name: b.get("name").and_then(Value::as_str)?.to_owned(),
+                arguments: b.get("input").cloned().unwrap_or(json!({})).to_string(),
+            })
+        })
+        .collect();
+    let stop = payload.get("stop_reason").and_then(Value::as_str);
+    Completion { text, tool_calls, finished: !matches!(stop, Some("max_tokens")) }
 }
 
 fn merge_extra(body: &mut Value, backend: Option<&Backend>) {
@@ -350,7 +556,6 @@ fn merge_extra(body: &mut Value, backend: Option<&Backend>) {
     }
 }
 
-#[cfg(test)]
 pub mod testing {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -380,14 +585,44 @@ pub mod testing {
         }
     }
 
-    #[async_trait]
-    impl LlmClient for ScriptedLlm {
-        async fn complete(&self, model: &str, messages: &[ChatMessage], _: &CompletionParams) -> Result<String> {
+    impl ScriptedLlm {
+        fn next_reply(&self, model: &str, messages: &[ChatMessage]) -> String {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.models.lock().unwrap().push(model.to_owned());
             self.prompts.lock().unwrap().push(messages.last().map(|m| m.content.clone()).unwrap_or_default());
             let mut replies = self.replies.lock().unwrap();
-            Ok(if replies.len() > 1 { replies.remove(0) } else { replies.first().cloned().unwrap_or_default() })
+            if replies.len() > 1 { replies.remove(0) } else { replies.first().cloned().unwrap_or_default() }
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for ScriptedLlm {
+        async fn complete(&self, model: &str, messages: &[ChatMessage], _: &CompletionParams) -> Result<String> {
+            Ok(self.next_reply(model, messages))
+        }
+
+        async fn complete_turn(
+            &self,
+            model: &str,
+            messages: &[ChatMessage],
+            _: &CompletionParams,
+            _: &[ToolSpec],
+        ) -> Result<Completion> {
+            let reply = self.next_reply(model, messages);
+            if let Some(rest) = reply.strip_prefix("TOOL ")
+                && let Some((name, args)) = rest.split_once(' ')
+            {
+                return Ok(Completion {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: format!("call_{}", self.calls()),
+                        name: name.to_owned(),
+                        arguments: args.to_owned(),
+                    }],
+                    finished: true,
+                });
+            }
+            Ok(Completion { text: reply, tool_calls: Vec::new(), finished: true })
         }
     }
 
