@@ -49,6 +49,40 @@ pub trait AgentBackend: Send + Sync {
     }
 }
 
+#[async_trait]
+impl<T: AgentBackend + ?Sized> AgentBackend for std::sync::Arc<T> {
+    fn api_key(&self) -> Option<&str> {
+        (**self).api_key()
+    }
+    fn instructions(&self) -> Option<&str> {
+        (**self).instructions()
+    }
+    fn base_url(&self) -> &str {
+        (**self).base_url()
+    }
+    async fn list_documents(&self, limit: usize, offset: usize) -> Result<Value> {
+        (**self).list_documents(limit, offset).await
+    }
+    async fn get_document(&self, doc_id: &str) -> Result<Value> {
+        (**self).get_document(doc_id).await
+    }
+    async fn get_tree(&self, doc_id: &str, node_summary: bool, include_text: bool) -> Result<Value> {
+        (**self).get_tree(doc_id, node_summary, include_text).await
+    }
+    async fn get_ocr_pages(&self, doc_id: &str) -> Result<Value> {
+        (**self).get_ocr_pages(doc_id).await
+    }
+    async fn delete_document(&self, doc_id: &str) -> Result<()> {
+        (**self).delete_document(doc_id).await
+    }
+    async fn get_block(&self, doc_id: &str, block_id: &str) -> Result<Value> {
+        (**self).get_block(doc_id, block_id).await
+    }
+    async fn list_folders(&self) -> Result<Value> {
+        (**self).list_folders().await
+    }
+}
+
 fn page_spec_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^(\d+(-\d+)?)(,\s*\d+(-\d+)?)*$").expect("page spec regex"))
@@ -1245,6 +1279,28 @@ pub fn as_anthropic_tools(include_management: bool) -> Value {
                     "description": spec.description,
                     "input_schema": spec.parameters
                 })
+            })
+            .collect(),
+    )
+}
+
+/// MCP `tools/list` descriptors (`inputSchema` + annotations).
+pub fn as_mcp_tools(include_management: bool) -> Value {
+    let contract = tool_contract();
+    Value::Array(
+        tool_names(include_management)
+            .into_iter()
+            .map(|name| {
+                let spec = local_tool_spec(name);
+                let mut tool = json!({
+                    "name": spec.name,
+                    "description": spec.description,
+                    "inputSchema": spec.parameters,
+                });
+                if let Some(annotations) = contract[name].get("annotations") {
+                    tool["annotations"] = annotations.clone();
+                }
+                tool
             })
             .collect(),
     )

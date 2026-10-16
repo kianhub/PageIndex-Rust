@@ -25,18 +25,21 @@ navigate instead of a vector index.
   `get_document`, `get_document_structure`, `get_page_content`, `remove_document`). Cloud
   retrieval (`submit_query` / `get_retrieval`) is unchanged from upstream.
 - **Clients**: `PageIndexLocalClient`, `PageIndexCloudClient`, and unified `PageIndexClient`.
-- **Agent / MCP**: native tool loop plus OpenAI / Anthropic / Claude MCP adapter JSON;
-  `McpBridge` talks to the cloud MCP server (streamable HTTP).
+- **Agent / MCP**: native Rust tool loop (the default) plus OpenAI / Anthropic / Claude MCP
+  adapter JSON. `McpBridge` is a Streamable HTTP client; `McpServer` is the matching
+  local server official runners attach to (`openai-agents` `MCPServerStreamableHttp`,
+  Anthropic MCP connector).
 - **Imaging**: `highlight_region` overlays a bbox on a page image (PNG). Cloud page images
   and layout blocks are fetched through the API.
 
-The workspace has three crates:
+The workspace has four crates (`cargo test` / `cargo clippy` build the first three):
 
 | Crate | Contents |
 |---|---|
 | `pageindex-pdf` | Character-level PDF extraction (pure Rust, built on `lopdf`) and bookmark reading |
 | `pageindex` | The library: Flash, classic, optimize, summaries, Markdown, chat, cloud, MCP, config, store |
 | `pageindex-cli` | The `pageindex` binary, equivalent to upstream's `run_pageindex.py` |
+| `pageindex-py` | Optional PyO3 bindings (maturin). Not a default member; needs Python |
 
 ## Build and run
 
@@ -123,15 +126,51 @@ Re-run (speed and memory): `PAGEINDEX_PYTHON=/path/to/PageIndex cargo bench -p p
 | ja_report | 4 | 33.3 / 0.60 | 33.3 / 1.55 | 33.3 / 17.5 | 49965 |
 | ar_report | 4 | 26.3 / 1.75 | 28.1 / 2.35 | 28.1 / 17.5 | 87868 |
 
+## SDK bridge (opt-in)
+
+The native Rust tool loop stays the default. To drive PageIndex-Rust from the
+official OpenAI Agents SDK (`Runner`) or Anthropic SDK tool runner, use the
+optional Python crate — it is not built by `cargo test` / `cargo clippy`.
+
+```bash
+pip install maturin pytest
+maturin develop -m crates/pageindex-py/Cargo.toml
+pytest crates/pageindex-py
+```
+
+```python
+from agents import Agent, Runner
+from agents.mcp import MCPServerStreamableHttp
+from pageindex import Client, as_openai_tools, as_anthropic_tools
+
+client = Client(storage_path="./.pageindex")
+client.submit_document("paper.pdf")
+
+# In-process tools (FunctionTool / beta_tool), stub-LLM friendly:
+tools = as_openai_tools(client)
+# tools = as_anthropic_tools(client)  # client.beta.messages.tool_runner(tools=...)
+
+# Or attach the Streamable HTTP MCP server those runners already speak:
+server = client.serve_mcp()
+# MCPServerStreamableHttp(params={"url": server.url})
+# Anthropic: mcp_servers=[{"type": "url", "name": "pageindex", "url": server.url}]
+```
+
+`page_index_flash`, `Client.submit_document` / `call_tool`, and `tool_names` are
+the same callables the helpers wrap. Pass `scripted_replies=[...]` to `Client`
+for tests; no API keys.
+
 ## Development
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+# Optional bindings (needs Python):
+# maturin develop -m crates/pageindex-py/Cargo.toml && pytest crates/pageindex-py
 ```
 
-No `unsafe`. Async is used for I/O and model calls.
+No `unsafe` beyond what PyO3 macros generate in `pageindex-py`. Async is used for I/O and model calls.
 
 ## License
 
